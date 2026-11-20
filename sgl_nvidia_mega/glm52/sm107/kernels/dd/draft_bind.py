@@ -26,7 +26,6 @@ def contract():
              {"role": "embed_sharded", "kind": "scalar", "owner": "caller"},
              {"role": "eh_w", "kind": "tensor", "owner": "prepared-layer"},
              {"role": "gamma_enorm", "kind": "tensor", "owner": "prepared-layer"},
-             {"role": "stamps", "kind": "tensor", "owner": "caller"},
              {"role": "scale", "kind": "constexpr", "owner": "caller"},
              {"role": "stream", "kind": "stream", "owner": "caller"},
              {"role": "use_pdl", "kind": "constexpr", "owner": "caller"},
@@ -48,7 +47,7 @@ def _call(request, proxies, with_target_argmax, with_target_sample):
     args += [tensor(n) for n in S0_TENSORS]
     args += [cutlass.Int64(values["idx_stride_bytes"]), cutlass.Int64(values["idx_pages"]),
              tensor("idx_candidates"), tensor("embed"), cutlass.Boolean(values["embed_sharded"]),
-             tensor("eh_w"), tensor("gamma_enorm"), tensor("stamps"), float(values["scale"]),
+             tensor("eh_w"), tensor("gamma_enorm"), float(values["scale"]),
              driver.CUstream(request["stream"]), bool(request["pdl"]), with_target_argmax, with_target_sample]
     return {"entry": draft_entry, "args": tuple(args), "argument_contract": contract()}
 

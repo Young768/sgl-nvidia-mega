@@ -29,8 +29,6 @@ X_BASE = STAGES * STAGE_BYTES
 RED_FLOATS = TILES_PER_CTA * 1024 + 16
 RED_KEYS = TILES_PER_CTA * 1024
 REL_SYNC = len(_CFG) < 4 or _CFG[3] == 0
-X_ROWS_DIAG = _CFG[8] if len(_CFG) > 8 else 0
-EPI_ROWS_DIAG = _CFG[9] if len(_CFG) > 9 else 0
 KEY_STRIDE = _CFG[10] if len(_CFG) > 10 else 1
 RED_ALIAS = len(_CFG) > 7 and _CFG[7] != 0
 FP8_KEEP = False
@@ -44,7 +42,6 @@ BARS = STAGES + X_STAGES + (STAGES8 - STAGES)
 LOADS = TILES_PER_CTA * CHUNKS
 STEPS = CHUNK_K // (8 * 32)
 KEEP_CHUNKS = 0
-ABL_L2_TILES = 0
 
 
 @dsl_user_op
@@ -157,8 +154,6 @@ def issue_lm_chunk_lane(cta: cutlass.Int32, load: cutlass.Int32, weights: cute.T
         rows = 0
     bar = bars.iterator + stage
     base = region.iterator.toint().to(cutlass.Uint32) + cutlass.Uint32(stage * STAGE_BYTES)
-    if cutlass.const_expr(ABL_L2_TILES > 0):
-        tile = tile % ABL_L2_TILES
     keep = cutlass.Boolean(False)
     if cutlass.const_expr(KEEP_CHUNKS > 0):
         keep = (chunk >= 1) & (chunk <= KEEP_CHUNKS)
@@ -212,8 +207,6 @@ def issue_lm_chunk(cta: cutlass.Int32, load: cutlass.Int32, weights: cute.Tensor
 def issue_x_chunk(x: cute.Tensor, c: cutlass.Constexpr, rows: cutlass.Int32, region: cute.Tensor, bars: cute.Tensor,
                   tid):
     xs = c % X_STAGES
-    if cutlass.const_expr(X_ROWS_DIAG > 0):
-        rows = cutlass.Int32(X_ROWS_DIAG)
     bar = bars.iterator + (STAGES + xs)
     base = region.iterator.toint().to(cutlass.Uint32) + cutlass.Uint32(X_BASE + xs * X_STAGE_BYTES)
     if tid == 0:
@@ -294,8 +287,8 @@ def load_x_chunk(x: cute.Tensor, xv: cute.Tensor, c: cutlass.Constexpr, has_row,
 def lm_head_stage(cta: cutlass.Int32, x: cute.Tensor, weights: cute.Tensor, region: cute.Tensor,
                   red: cute.Tensor, bars: cute.Tensor, keys: cute.Tensor, arrivals: cute.Tensor,
                   rows: cutlass.Int32, logits_out: cute.Tensor, poll: cutlass.Constexpr,
-                  write_logits: cutlass.Constexpr, stamp_at=None, table_prefetch=None, stamp_from: cutlass.Constexpr = 0,
-                  fp8: cutlass.Constexpr = False, scales=None, rescore=None, xscale=None):
+                  write_logits: cutlass.Constexpr, table_prefetch=None, fp8: cutlass.Constexpr = False, scales=None,
+                  rescore=None, xscale=None):
     tid, _, _ = cute.arch.thread_idx()
     warp, lane = tid >> 5, tid & 31
     group, tig = lane >> 2, lane & 3
@@ -321,9 +314,6 @@ def lm_head_stage(cta: cutlass.Int32, x: cute.Tensor, weights: cute.Tensor, regi
                 for s8 in cutlass.range_constexpr(STEPS):
                     for j8 in cutlass.range_constexpr(4):
                         xv[s8, j8] = bf16x2_to_f16x2(xv[s8, j8])
-            if cutlass.const_expr(stamp_at is not None and c == 0):
-                if (tid == 0) & (cta >= stamp_from):
-                    stamp_at[0] = global_timer()
         elif cutlass.const_expr(c + 1 < CHUNKS):
             load_x_chunk(x, xbuf[(c + 1) % 2], c + 1, has_row, group, warp, tig, poll, region, bars, rows)
         for t in cutlass.range_constexpr(TILES_PER_CTA):
@@ -388,9 +378,6 @@ def lm_head_stage(cta: cutlass.Int32, x: cute.Tensor, weights: cute.Tensor, regi
                         if cutlass.const_expr(X_SMEM and t == 0 and c + X_STAGES < CHUNKS):
                             if (lane >= 16) & (lane < 24):
                                 issue_x_chunk(x, c + X_STAGES, rows, region, bars, lane - 16)
-    if cutlass.const_expr(stamp_at is not None):
-        if (tid == 0) & (cta >= stamp_from):
-            stamp_at[1] = global_timer()
     if cutlass.const_expr(RED_ALIAS):
         cute.arch.sync_threads()
     for t in cutlass.range_constexpr(TILES_PER_CTA):
@@ -400,9 +387,7 @@ def lm_head_stage(cta: cutlass.Int32, x: cute.Tensor, weights: cute.Tensor, regi
         red[RED_KEYS + tid] = bits_f32(cutlass.Uint32(0))
     cute.arch.sync_threads()
     kaddr = red.iterator.toint().to(cutlass.Uint32) + cutlass.Uint32(RED_KEYS * 4)
-    erows = rows
-    if cutlass.const_expr(EPI_ROWS_DIAG > 0):
-        erows = cutlass.Int32(EPI_ROWS_DIAG)
+
     for j in cutlass.range_constexpr((TILES_PER_CTA * 128 + 255) // 256):
         vi = tid + 256 * j
         if vi < TILES_PER_CTA * 128:
@@ -421,7 +406,7 @@ def lm_head_stage(cta: cutlass.Int32, x: cute.Tensor, weights: cute.Tensor, regi
                     if cutlass.const_expr(xscale is not None):
                         v = v * xscale[0]
             bits = bf16_pair(v, v) << 16
-            if (index < VOCAB_SHARD) & (token < erows):
+            if (index < VOCAB_SHARD) & (token < rows):
                 if cutlass.const_expr(write_logits):
                     logits_out[token * VOCAB_SHARD + index] = bits_f32(bits)
                 shared_max_u64(kaddr + (token * 8).to(cutlass.Uint32), argmax_key(bits, index))
@@ -476,8 +461,6 @@ FP4_X_OFFSET = TILES_PER_CTA * 16 * FP4_SMEM_STRIDE
 FP4_DOT = False
 FP4_INT_DECODE = 0
 FP4_UNROLL = 2
-FP4_TEST_KSTEPS = 0
-FP4_TEST_NO_RESCORE = False
 FP4_RESCORE_TILES = False
 
 
@@ -635,8 +618,7 @@ def lm_head_fp4_stage(cta: cutlass.Int32, x: cute.Tensor, region: cute.Tensor, r
                 acc_a[t, 0] = ra0[t]
                 acc_a[t, 2] = rb0[t]
     ksteps = HIDDEN // (8 * 32)
-    nsteps = FP4_TEST_KSTEPS if FP4_TEST_KSTEPS > 0 else ksteps
-    for s in cutlass.range(0 if FP4_DOT else nsteps, unroll=FP4_UNROLL):
+    for s in cutlass.range(0 if FP4_DOT else ksteps, unroll=FP4_UNROLL):
         k0 = warp * (ksteps * 32) + s * 32 + tig * 8
         xw = cute.make_rmem_tensor((4,), cutlass.Uint32)
         for j in cutlass.range_constexpr(4):
@@ -702,10 +684,6 @@ def lm_head_fp4_stage(cta: cutlass.Int32, x: cute.Tensor, region: cute.Tensor, r
     cute.arch.sync_threads()
     ncand = TILES_PER_CTA if FP4_RESCORE_TILES else 1
     best = cutlass.Uint64(0)
-    if cutlass.const_expr(FP4_TEST_NO_RESCORE):
-        ncand = 0
-        best = (f32_bits(red[RED_KEYS + 1]).to(cutlass.Uint64) << cutlass.Uint64(32)) | \
-            f32_bits(red[RED_KEYS]).to(cutlass.Uint64)
     for c in cutlass.range_constexpr(ncand):
         kc = (f32_bits(red[RED_KEYS + 2 * c + 1]).to(cutlass.Uint64) << cutlass.Uint64(32)) | \
             f32_bits(red[RED_KEYS + 2 * c]).to(cutlass.Uint64)
@@ -718,11 +696,6 @@ def lm_head_fp4_stage(cta: cutlass.Int32, x: cute.Tensor, region: cute.Tensor, r
     if tid == 0:
         atom_max_u64(keys.iterator, best)
         release_add_u32(arrivals.iterator, cutlass.Uint32(1))
-
-
-@dsl_user_op
-def global_timer(*, loc=None, ip=None):
-    return cutlass.Uint64(cute.arch.globaltimer(loc=loc, ip=ip))
 
 
 # Imported last: the role modules import each other, and their names are used only when a kernel is traced.

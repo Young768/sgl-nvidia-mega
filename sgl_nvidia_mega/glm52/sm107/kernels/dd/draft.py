@@ -57,9 +57,6 @@ DSM_BARS = B_EH + s0.EH_BARS
 DSM_BIAS = moe.SM_WORDS + 2 * DSM_BARS
 DSM_WORDS = DSM_BIAS + 256
 BIAS_SMEM = True
-ABL_HOPS = False
-ABL_ROUTE_VARY = False
-ABL_ROUTE = False
 ROUTER_LG = True
 LG_W_WORDS = 16 * 38 * 512
 W_ROUTER_ELEMS = 256 * 6144 + (2 * LG_W_WORDS if ROUTER_LG else 0)
@@ -67,7 +64,6 @@ ROUTE_EARLY_ISSUE = False
 LM_L2_KEEP_CHUNKS = 0
 if LM_L2_KEEP_CHUNKS:
     lm.KEEP_CHUNKS = LM_L2_KEEP_CHUNKS
-DIAG_XDUMP = False
 H2_XAMAX = False
 SHORT_CTX = True
 LM_FP8 = False
@@ -88,11 +84,6 @@ if LM_FP4_DOT:
 W_LM_ELEMS = VOCAB_SHARD * HIDDEN + ((VOCAB_SHARD * HIDDEN) // 2 + 2 * VOCAB_SHARD if LM_FP8 else 0) + \
     ((VOCAB_SHARD * lm.FP4_ROW_BYTES + 4 * VOCAB_SHARD) // 2 if LM_FP4 else 0)
 LM_TABLE_PF = False
-LM_ABL_L2_TILES = 0
-if LM_ABL_L2_TILES:
-    lm.ABL_L2_TILES = LM_ABL_L2_TILES
-DIAG_PREFIX = False
-DIAG_LM = False
 HOP_LEAN = True
 # Idle H1 / H2 units run one pre-pass of the hop on scratch, so its run-once code is instruction-cache warm when the
 # shards land.
@@ -105,8 +96,6 @@ WARM_L2_PROBE = False
 H2_CLEAR_LATE = True
 WARM_O = True
 WARM_MERGE = True
-DIAG_HOP = False
-DIAG_ROUTE = False
 
 KIND_SK, KIND_T, KIND_S0 = 0, 1, 2
 KIND_TA = 3
@@ -125,13 +114,7 @@ TS_R3 = 8 * TS_ROW
 TS_RES = 8 * TS_ROW
 TS_PRUNE = 1.0 / (1 << 29)
 TS_LANE_HIST = 32 * 257
-TS_DIAG = False
 TS_RES_ROW = 24
-STAMP_SLOTS, STAMP_EVENTS = 8, 16
-STAMPS = False
-ST_ENTRY, ST_FRONT, ST_PREFIX, ST_ATTN, ST_O, ST_H1, ST_ROUTE, ST_FC1, ST_FC2, ST_H2, ST_LM = range(11)
-ST_RW, ST_F1W, ST_LMW = 11, 12, 13
-ST_RLOG, ST_RPOLL = 14, 15
 L2_PREFETCH = True
 D_XAMAX = P1_WORD + 60544
 D_SH = P1_WORD + 57472
@@ -159,14 +142,6 @@ def fence_proxy_global(*, loc=None, ip=None):
 
 
 lds64 = lm.lds64w
-
-
-@cute.jit
-def stamp(stamps: cute.Tensor, base: cutlass.Int32, event: cutlass.Constexpr):
-    tid, _, _ = cute.arch.thread_idx()
-    if cutlass.const_expr(STAMPS):
-        if tid == 0:
-            stamps[base + event] = lm.global_timer()
 
 
 @cute.jit
@@ -207,21 +182,9 @@ def lm_prefetch_chunks(cta: cutlass.Int32, w_lm: cute.Tensor, chunks: cutlass.Co
 
 
 @cute.jit
-def own_slot(pointer: cute.Pointer):
-    a, b, c, d = poll_vector(pointer)
-    out = cute.make_rmem_tensor((8,), cutlass.Float32)
-    w = (a, b, c, d)
-    for j in cutlass.range_constexpr(4):
-        out[2 * j] = bf16_from_word(w[j], False)
-        out[2 * j + 1] = bf16_from_word(w[j], True)
-    return out
-
-
-@cute.jit
 def row_hop(second: cutlass.Constexpr, sel: cutlass.Int32, hop1: cute.Tensor, hop2: cute.Tensor,
             previous_hop2: cute.Tensor, residual_input: cute.Tensor, gamma: cute.Tensor, keep: cute.Tensor,
-            scalars: cute.Tensor, out_main: cute.Tensor, rout: cute.Tensor, done: cute.Tensor,
-            rank: cutlass.Int32 = 0):
+            scalars: cute.Tensor, out_main: cute.Tensor, rout: cute.Tensor, done: cute.Tensor):
     tid, _, _ = cute.arch.thread_idx()
     warp, lane = tid >> 5, tid & 31
     xs = cute.make_rmem_tensor((24,), cutlass.Float32)
@@ -230,18 +193,12 @@ def row_hop(second: cutlass.Constexpr, sel: cutlass.Int32, hop1: cute.Tensor, ho
         col = 2048 * j + 8 * tid
         if cutlass.const_expr(second):
             self_clear(hop1, previous_hop2, sel, col)
-            if cutlass.const_expr(ABL_HOPS):
-                sums = own_slot(hop2.iterator + (sel * RANKS + rank) * 3072 + col // 2)
-            else:
-                sums = reduce_rank16(hop2, sel, col, False)
+            sums = reduce_rank16(hop2, sel, col, False)
             if cutlass.const_expr(H2_CLEAR_CURRENT):
                 for r in cutlass.range_constexpr(RANKS):
                     store_empty(hop2.iterator + (sel * RANKS + r) * 3072 + col // 2, evict_first())
         else:
-            if cutlass.const_expr(ABL_HOPS):
-                sums = own_slot(hop1.iterator + ((rank * 192 + col // 32) * 8 + sel) * 16 + (col % 32) // 2)
-            else:
-                sums = reduce_rank16(hop1, sel, col, True)
+            sums = reduce_rank16(hop1, sel, col, True)
         prev = cute.make_rmem_tensor((4,), cutlass.Uint32)
         if cutlass.const_expr(second):
             for q in cutlass.range_constexpr(4):
@@ -300,21 +257,6 @@ def hop_warm(passes, scratch, scratch_ssq, second=False):
 
 def o_warm(passes):
     return dict(passes=passes) if WARM_O else {}
-
-
-def hop_diag(stamps, sbase, events):
-    if STAMPS and DIAG_HOP:
-        return dict(diag=stamps, diag_base=sbase, diag_events=events)
-    return {}
-
-
-@cute.jit
-def stamp_ready(stamps: cute.Tensor, base: cutlass.Int32, event: cutlass.Constexpr, bar: cute.Pointer):
-    tid, _, _ = cute.arch.thread_idx()
-    if cutlass.const_expr(STAMPS and not DIAG_ROUTE and not DIAG_HOP and not DIAG_PREFIX):
-        if tid == 32:
-            cute.arch.mbarrier_wait(bar, 0)
-            stamps[base + event] = lm.global_timer()
 
 
 @cute.jit
@@ -922,19 +864,6 @@ def ts_poll16(base: cute.Pointer, stride: cutlass.Constexpr, out: cute.Tensor):
 
 
 @cute.jit
-def ts_mark(params: cute.Tensor, t0: cutlass.Uint64, phase: cutlass.Constexpr):
-    if cutlass.const_expr(TS_DIAG):
-        tid, _, _ = cute.arch.thread_idx()
-        cta, _, _ = cute.arch.block_idx()
-        if (tid == 0) & ((cta == 0) | (cta == 7)):
-            slot = 16 + phase
-            if cta == 7:
-                slot = 32 + phase
-            ptr = params.iterator + slot
-            cute.make_tensor(ptr, cute.make_layout((1,)))[0] = (lm.global_timer() - t0).to(cutlass.Float32)
-
-
-@cute.jit
 def ts_block_reduce(v: cutlass.Float32, red: cute.Tensor, base: cutlass.Constexpr, is_max: cutlass.Constexpr):
     tid, _, _ = cute.arch.thread_idx()
     warp, lane = tid >> 5, tid & 31
@@ -1000,7 +929,6 @@ def target_sample(rank: cutlass.Int32, logits: cute.Tensor, params: cute.Tensor,
     tid, _, _ = cute.arch.thread_idx()
     cta, _, _ = cute.arch.block_idx()
     warp, lane = tid >> 5, tid & 31
-    t0 = lm.global_timer()
     cute.arch.griddepcontrol_wait()
     if cutlass.const_expr(not TS_LATE_DEP):
         cute.arch.griddepcontrol_launch_dependents()
@@ -1008,7 +936,6 @@ def target_sample(rank: cutlass.Int32, logits: cute.Tensor, params: cute.Tensor,
         reset_next_counters(next_counters)
     else:
         ts_bridge_reset(bridge[0], bridge[1], bridge[2])
-    ts_mark(params, t0, 0)
     if tid < 11:
         red[3008 + tid] = params[tid]
     elif tid < 18:
@@ -1073,7 +1000,6 @@ def target_sample(rank: cutlass.Int32, logits: cute.Tensor, params: cute.Tensor,
                     if ts_value(ts_vj(vals, rowbuf, per * tid + j, j)) == mx:
                         first = cutlass.Float32(per * tid + j)
         amx_col = -ts_block_reduce(-first, red, 560, True)
-        ts_mark(params, t0, 1)
         total = cutlass.Float32(0)
         if cutlass.const_expr(TS_ROLLED):
             col = cutlass.Int32(0)
@@ -1096,7 +1022,6 @@ def target_sample(rank: cutlass.Int32, logits: cute.Tensor, params: cute.Tensor,
             hsum = hsum + f32_bits(hist[l * 257 + tid]).to(cutlass.Uint64)
         red[tid] = hsum.to(cutlass.Float32) * cutlass.Float32(1.0 / TS_LFIX)
         cute.arch.sync_threads()
-        ts_mark(params, t0, 2)
         if tid < TS_ROW // 4:
             w = cute.make_rmem_tensor((4,), cutlass.Uint32)
             for k in cutlass.range_constexpr(4):
@@ -1123,7 +1048,6 @@ def target_sample(rank: cutlass.Int32, logits: cute.Tensor, params: cute.Tensor,
             red[512 + tid] = bits_f32(a)
             red[528 + tid] = bits_f32(b)
         cute.arch.sync_threads()
-        ts_mark(params, t0, 3)
         gm = red[512]
         for r in cutlass.range_constexpr(1, RANKS):
             gm = max_num(gm, red[512 + r])
@@ -1140,7 +1064,6 @@ def target_sample(rank: cutlass.Int32, logits: cute.Tensor, params: cute.Tensor,
         for r in cutlass.range_constexpr(RANKS):
             coarse[r] = bits_f32(cw[r]) * scales[r]
             csum = csum + coarse[r]
-        ts_mark(params, t0, 4)
         incl = ts_block_scan(csum, red, 576)
         if tid == 255:
             red[604] = incl
@@ -1154,7 +1077,6 @@ def target_sample(rank: cutlass.Int32, logits: cute.Tensor, params: cute.Tensor,
             red[601] = incl - csum
         cute.arch.sync_threads()
         bstar = f32_bits(red[600])
-        ts_mark(params, t0, 5)
         c_above = red[601]
         if tid == 0:
             owner_a = cutlass.Int32(-1)
@@ -1189,7 +1111,6 @@ def target_sample(rank: cutlass.Int32, logits: cute.Tensor, params: cute.Tensor,
             hsum2 = hsum2 + f32_bits(hist[TS_LANE_HIST + l * 257 + tid]).to(cutlass.Uint64)
         red[256 + tid] = hsum2.to(cutlass.Float32) * cutlass.Float32(1.0 / TS_LFIX)
         cute.arch.sync_threads()
-        ts_mark(params, t0, 6)
         if tid < TS_ROW // 4:
             w2 = cute.make_rmem_tensor((4,), cutlass.Uint32)
             for k in cutlass.range_constexpr(4):
@@ -1207,7 +1128,6 @@ def target_sample(rank: cutlass.Int32, logits: cute.Tensor, params: cute.Tensor,
         for r in cutlass.range_constexpr(RANKS):
             fine[r] = bits_f32(fw[r])
             fsum = fsum + fine[r]
-        ts_mark(params, t0, 7)
         incl2 = c_above + ts_block_scan(fsum, red, 576)
         if tid == 255:
             red[602] = bits_f32(cutlass.Uint32(0))
@@ -1274,15 +1194,12 @@ def target_sample(rank: cutlass.Int32, logits: cute.Tensor, params: cute.Tensor,
         cute.arch.sync_threads()
         if tid == 0:
             lm.release_add_u32(arrivals.iterator, cutlass.Uint32(1))
-        ts_mark(params, t0, 8)
         if cutlass.const_expr(bridge is None):
             clear_assigned(next_arena, next_tk, clear_counter)
         else:
             ts_bridge_clear(next_arena, next_tk, clear_counter, bridge[2])
-        ts_mark(params, t0, 9)
         if t == 7:
             wait_count(arrivals, cutlass.Uint32(8))
-            ts_mark(params, t0, 10)
             if tid < 8 * TS_RES_ROW // 4:
                 a4, b4, c4, d4 = volatile_vector(res.iterator + 4 * tid)
                 red[2304 + 4 * tid] = bits_f32(a4)
@@ -1342,15 +1259,8 @@ def target_sample(rank: cutlass.Int32, logits: cute.Tensor, params: cute.Tensor,
                     cum = cum + msv
                 if sstar < 0:
                     sstar, ulocal = last_s, last_m
-                if cutlass.const_expr(TS_DIAG):
-                    params[48] = cutlass.Float32(1.0)
-                    params[49] = n.to(cutlass.Float32)
-                    params[50] = sstar.to(cutlass.Float32)
-                    params[51] = ulocal
-                    params[52] = k_f - e_d
                 store_vector(res.iterator + 8 * TS_RES_ROW, n.to(cutlass.Uint32), sstar.to(cutlass.Uint32),
                              f32_bits(ulocal), cutlass.Uint32(1))
-            ts_mark(params, t0, 11)
         if tid == 0:
             dn, ds, du, _d1 = poll_vector(res.iterator + 8 * TS_RES_ROW)
             red[2048] = bits_f32(dn)
@@ -1398,7 +1308,6 @@ def target_sample(rank: cutlass.Int32, logits: cute.Tensor, params: cute.Tensor,
         if tid == 0:
             lm.release_add_u32(arrivals.iterator, cutlass.Uint32(1))
         if t == 7:
-            ts_mark(params, t0, 12)
             wait_count(arrivals, cutlass.Uint32(16))
             if tid == 0:
                 tok, _n2, _a, _b = poll_vector(r1_uc.iterator + sstar_s * PK_SLOT + TS_R3)
@@ -1420,7 +1329,6 @@ def target_sample(rank: cutlass.Int32, logits: cute.Tensor, params: cute.Tensor,
             if tid < (8 * TS_RES_ROW + 4) // 4:
                 store_empty(res.iterator + 4 * tid, evict_first())
             cute.arch.sync_threads()
-            ts_mark(params, t0, 13)
     else:
         if cutlass.const_expr(bridge is None):
             clear_assigned(next_arena, next_tk, clear_counter)
@@ -1447,19 +1355,12 @@ def draft_kernel(
     wfa_leader_ptr: cute.Pointer, widx_raw_ptr: cute.Pointer, idx_kn_w_ptr: cute.Pointer, idx_kn_b_ptr: cute.Pointer,
     idx_rope_raw_ptr: cute.Pointer, idx_pool_raw_ptr: cute.Pointer, idx_blocks_raw_ptr: cute.Pointer,
     idx_stride_bytes: cutlass.Int64, idx_pages: cutlass.Int64, idx_candidates_raw: cute.Tensor,
-    key_atom: cute.CopyAtom, embed_raw: cute.Tensor, embed_sharded: cutlass.Boolean, eh_w: cute.Tensor,
-    gamma_enorm_raw: cute.Tensor, stamps: cute.Tensor, eh_atom: cute.CopyAtom, scale: cutlass.Constexpr,
+    key_atom: cute.CopyAtom, embed_raw: cute.Tensor, embed_sharded: cutlass.Boolean, gamma_enorm_raw: cute.Tensor,
+    eh_atom: cute.CopyAtom, scale: cutlass.Constexpr,
     with_target_argmax: cutlass.Constexpr, with_target_sample: cutlass.Constexpr,
 ):
     tid, _, _ = cute.arch.thread_idx()
     cta, _, _ = cute.arch.block_idx()
-    slot = cutlass.Int32(0)
-    if kind == KIND_S0:
-        slot = cutlass.Int32(1)
-    if kind == KIND_SK:
-        slot = 1 + step
-    sbase = (slot * 212 + cta) * STAMP_EVENTS
-    stamp(stamps, sbase, ST_ENTRY)
     allocator = SmemAllocator()
     storage = allocator.allocate_tensor(cutlass.Uint32, cute.make_layout((SHARED_WORDS,)), byte_alignment=1024)
     dsm = allocator.allocate_tensor(cutlass.Uint32, cute.make_layout((DSM_WORDS,)), byte_alignment=16)
@@ -1615,7 +1516,6 @@ def draft_kernel(
                     word_view(mc_raw, PK_BASE + copy * PK_COPY, (T_HEADS,), (1,)),
                     word_view(uc_raw, PK_BASE + copy * PK_COPY, (T_HEADS,), (1,)), draft_tokens, accepted,
                     num_accepted, next_arena, next_tk, clear_counter, next_counters)
-        stamp(stamps, sbase, ST_LM)
     else:
         is_s0 = kind == KIND_S0
         xn_view = word_view(arena_raw, current + D_XN, (24576,), (1,))
@@ -1625,13 +1525,12 @@ def draft_kernel(
             s0.s0_front(cta, rank, accepted, word_view(embed_raw, 0, (cute.size(embed_raw) // 2,), (1,)),
                         embed_sharded, word_view(uc_raw, EMB_BASE, (s0.EMB_WORDS,), (1,)),
                         word_view(mc_raw, EMB_BASE, (s0.EMB_WORDS,), (1,)), word_view(x_raw, 0, (24576,), (1,)),
-                        word_view(gamma_enorm_raw, 0, (3072,), (1,)), gamma_hnorm, eh_w,
-                        word_view(arena_raw, current + D_NW, (s0.NW_WORDS,), (1,)),
+                        word_view(gamma_enorm_raw, 0, (3072,), (1,)), gamma_hnorm, word_view(arena_raw,
+                        current + D_NW, (s0.NW_WORDS,), (1,)),
                         word_view(uc_raw, EH_BASE, (s0.EH_WORDS,), (1,)),
                         word_view(mc_raw, EH_BASE, (s0.EH_WORDS,), (1,)), gamma_in, residual_input, x_frag, x_ssq,
                         region, red, scalars, cute.make_tensor(dbars.iterator + B_EH, cute.make_layout((s0.EH_BARS,))),
                         eh_atom, tmem_slot, *xn_args)
-            stamp(stamps, sbase, ST_FRONT)
             rope_rows = cute.size(rope_raw) // 128
             leader_front_body(x_raw, cute.make_tensor(wfa_leader_ptr, cute.make_layout((174 * 196608,))), wqb_raw,
                               cute.make_tensor(widx_raw_ptr, cute.make_layout((256 * 65536,))), gamma_kv, rope_raw,
@@ -1652,15 +1551,11 @@ def draft_kernel(
                 cute.arch.griddepcontrol_wait()
                 draft_front_unit(cta - 180, read_packets, gamma_in, residual_input, x_frag, x_ssq, scalars,
                                  front_done, draft_tokens, step, *xn_args)
-            stamp(stamps, sbase, ST_FRONT)
             plain_front_body(x, x_frag, x_ssq, previous_clear, cutlass.Boolean(True), wfa, wqb, y, q8, gamma_kv,
                              rope, lview, table, cache, kv_arena, stride_rows, layer_rows, next_counters,
                              y_mc, storage, append_from=cutlass.Int32(TOKEN),
                              **({} if not s0.FA_STOCK else dict(fa_carry=xn_view, fa_scale_carry=cutlass.Boolean(False),
-                                                                fa_stock=True)),
-                             stamp_at=cute.make_tensor(stamps.iterator + sbase + 11, cute.make_layout((3,)))
-                             if (STAMPS and DIAG_PREFIX) else None, short_ctx=SHORT_CTX)
-        stamp(stamps, sbase, ST_PREFIX)
+                                                                fa_stock=True)), short_ctx=SHORT_CTX)
         sel = cutlass.Int32(TOKEN)
         extra = cutlass.Int32(SHARED_TOKEN)
         window = cutlass.Int32(1)
@@ -1692,7 +1587,6 @@ def draft_kernel(
                         issue_o(cta, wo, wo, storage, all_bars.iterator + 1, False)
                 else:
                     issue_o(cta, wo, wo, storage, all_bars.iterator + 1, False)
-        stamp(stamps, sbase, ST_ATTN)
         if cutlass.const_expr(L2_PREFETCH):
             if (cta < moe.ROUTER_UNITS) & (tid == 0) & (not ROUTER_LG):
                 prefetch_bulk_l2(w_router.iterator + 2 * cta * HIDDEN, cutlass.Uint32(2 * HIDDEN * 2))
@@ -1724,7 +1618,6 @@ def draft_kernel(
             proxy_fence()
             cute.arch.sync_threads()
 
-        stamp(stamps, sbase, ST_O)
         clear_assigned(next_arena, next_tk, clear_counter)
         h1_done = word_view(counters_raw, copy * COUNTER_WORDS + C_H1, (1,), (1,))
         h2_passes = cutlass.Int32(1)
@@ -1738,7 +1631,7 @@ def draft_kernel(
         if cutlass.const_expr(ROW_HOP):
             if cta == ROW_CTA:
                 row_hop(False, sel, hop1, hop2, previous_hop2, residual_input, gamma_post, red, scalars, h, rout,
-                        h1_done, rank)
+                        h1_done)
         elif cta >= 180:
             is_sel = (cta - 180) // 4 == sel
             probe = cutlass.Boolean(False)
@@ -1748,37 +1641,25 @@ def draft_kernel(
                 if cutlass.const_expr(WARM_L2_PROBE):
                     stage_hop(cta - 180, False, cutlass.Boolean(False), hop1, hop2, previous_hop2, residual_input,
                               gamma_post, cutlass.Float32(1), residual, scalars, ssq1, ssq2, h, hp, hfp4, dummy_x,
-                              dummy_ssq, xout, rout, lean=HOP_LEAN, own_rank=rank if ABL_HOPS else None, **hop_diag(stamps, sbase, (11, 12, 13)),
+                              dummy_ssq, xout, rout, lean=HOP_LEAN,
                               warm=(cutlass.Int32(1), dummy_x, dummy_ssq, probe))
                 else:
                     stage_hop(cta - 180, False, cutlass.Boolean(False), hop1, hop2, previous_hop2, residual_input,
                               gamma_post, cutlass.Float32(1), residual, scalars, ssq1, ssq2, h, hp, hfp4, dummy_x,
-                              dummy_ssq, xout, rout, lean=HOP_LEAN, own_rank=rank if ABL_HOPS else None, **hop_diag(stamps, sbase, (11, 12, 13)),
+                              dummy_ssq, xout, rout, lean=HOP_LEAN,
                               **hop_warm(warm_passes, dummy_x, dummy_ssq))
                 if cutlass.const_expr(SEL_H1):
                     cute.arch.sync_threads()
                     if (tid == 0) & is_sel:
                         release_increment(h1_done.iterator)
-        stamp(stamps, sbase, ST_H1)
         base = region.iterator.toint().to(cutlass.Uint32)
         fc2_base = base + cutlass.Uint32(moe.FC1_REGION)
         shared_out = word_view(arena_raw, current + D_SH, (3072,), (1,))
-        if cutlass.const_expr(ABL_ROUTE):
-            if tid < 8:
-                if cutlass.const_expr(ABL_ROUTE_VARY):
-                    sm[moe.SM_ROUTE + tid] = ((tid * 32 + 4 * step + copy) % 256).to(cutlass.Uint32)
-                else:
-                    sm[moe.SM_ROUTE + tid] = (tid * 32).to(cutlass.Uint32)
-                sm[moe.SM_ROUTE + 8 + tid] = f32_bits(cutlass.Float32(2.5 / 8))
-            cute.arch.sync_threads()
-        elif cutlass.const_expr(ROUTER_LG):
+        if cutlass.const_expr(ROUTER_LG):
             pass
         elif cta < moe.ROUTER_UNITS:
             moe.issue_router(cta, w_router, fc2_base, dbars.iterator + B_ROUTER)
-            stamp_ready(stamps, sbase, ST_RW, dbars.iterator + B_ROUTER)
             moe.router_unit(cta, h, sel * 3072, fc2_base, sm, router_logits, dbars.iterator + B_ROUTER, True)
-            if cutlass.const_expr(not DIAG_HOP):
-                stamp(stamps, sbase, ST_RLOG)
         rbias = bias_sm if BIAS_SMEM else bias
         route_fn = moe.route_moe_parallel if moe.ROUTE_PARALLEL else moe.route_moe
         rlog = router_logits
@@ -1797,22 +1678,7 @@ def draft_kernel(
         if cutlass.const_expr(H2_IDLE):
             in_moe = cta < FC1_CTAS
         if in_moe:
-            if cutlass.const_expr(ABL_ROUTE):
-                pass
-            elif cutlass.const_expr(STAMPS and DIAG_ROUTE):
-                route_fn(rlog, rbias, sm, scale, **lgk,
-                              stamp_at=cute.make_tensor(stamps.iterator + sbase + ST_RPOLL, cute.make_layout((1,))),
-                              probe=cute.make_tensor(stamps.iterator + sbase + 10, cute.make_layout((5,))))
-            elif cutlass.const_expr(STAMPS and not DIAG_HOP):
-                route_fn(rlog, rbias, sm, scale, **lgk,
-                              stamp_at=cute.make_tensor(stamps.iterator + sbase + ST_RPOLL, cute.make_layout((1,))))
-            else:
-                route_fn(rlog, rbias, sm, scale, **lgk)
-            stamp(stamps, sbase, ST_ROUTE)
-            if cutlass.const_expr(DIAG_XDUMP):
-                if (cta == 0) & (tid < 8):
-                    dump = cute.make_tensor(cute.recast_ptr(stamps.iterator, dtype=cutlass.Uint32), cute.make_layout((54272,)))
-                    dump[24592 + 8 * slot + tid] = sm[moe.SM_ROUTE + tid]
+            route_fn(rlog, rbias, sm, scale, **lgk)
             if cutlass.const_expr(LM_PF_CHUNKS > 0):
                 if cta < lm.LM_CTAS:
                     lm_prefetch_chunks(cta, w_lm)
@@ -1821,14 +1687,8 @@ def draft_kernel(
                 moe.issue_fc1(cta, FC1_CTAS, w3w1, sm, base, dbars.iterator + B_FC1, w_sgu)
                 if cta < moe.FC2_UNITS:
                     moe.issue_fc2(cta, w2, sm, fc2_base, dbars.iterator + B_FC2)
-            stamp_ready(stamps, sbase, ST_F1W, dbars.iterator + B_FC1)
-            moe.fc1_unit(cta, FC1_CTAS, h, sel * 3072, base, sm, act, dbars.iterator + B_FC1, True, 9 * (moe.INTER // 2))
-            stamp(stamps, sbase, ST_FC1)
-            if cutlass.const_expr(DIAG_XDUMP):
-                if cta == 0:
-                    dump = cute.make_tensor(cute.recast_ptr(stamps.iterator, dtype=cutlass.Uint32), cute.make_layout((54272,)))
-                    for j in cutlass.range_constexpr(12):
-                        dump[24656 + slot * 3072 + j * 256 + tid] = h[sel * 3072 + j * 256 + tid]
+            moe.fc1_unit(cta, FC1_CTAS, h, sel * 3072, base, sm, act, dbars.iterator + B_FC1, True,
+            9 * (moe.INTER // 2))
         if cta < moe.FC2_UNITS:
             if tid == 0:
                 ready = acquire_word(clear_counter.iterator)
@@ -1847,7 +1707,6 @@ def draft_kernel(
             if cutlass.const_expr(not SHARED_IN_FC2):
                 proxy_fence()
                 shared_down(cta - moe.FC2_UNITS, act, w_sdn, region, red, shared_out, 0, dbars.iterator + B_SD, None)
-        stamp(stamps, sbase, ST_FC2)
         tc_before()
         cute.arch.sync_threads()
         if tid // 32 == 0:
@@ -1874,7 +1733,7 @@ def draft_kernel(
                 unit = cta - 180
                 if cta == ROW_CTA:
                     row_hop(True, sel, hop1, hop2, previous_hop2, residual_input, gamma_head, red, scalars, xout, rout,
-                            x_ready, rank)
+                            x_ready)
                 if unit // 4 != sel:
                     if tid < 192:
                         self_clear(hop1, previous_hop2, unit // 4, 1536 * (unit % 4) + 8 * tid)
@@ -1890,8 +1749,10 @@ def draft_kernel(
             unit = cta - 180
             if unit // 4 == sel:
                 stage_hop(unit, True, cutlass.Boolean(False), hop1, hop2, previous_hop2, residual_input, gamma_head,
-                          cutlass.Float32(1), residual, scalars, ssq1, ssq2, h, hp, hfp4, dummy_x, dummy_ssq, xout, rout,
-                          lean=HOP_LEAN, own_rank=rank if ABL_HOPS else None, **hop_diag(stamps, sbase, (14, 15)), **hop_warm(h2_passes if H2_IDLE else warm_passes, dummy_x, dummy_ssq, True),
+                          cutlass.Float32(1), residual, scalars, ssq1, ssq2, h, hp, hfp4, dummy_x, dummy_ssq, xout,
+                          rout,
+                          lean=HOP_LEAN,
+                          **hop_warm(h2_passes if H2_IDLE else warm_passes, dummy_x, dummy_ssq, True),
                           amax_out=word_view(arena_raw, current + D_XAMAX, (32,), (1,)) if H2_XAMAX else None)
                 if cutlass.const_expr(H2_CLEAR_CURRENT and not H2_CLEAR_LATE):
                     if tid < 192:
@@ -1919,16 +1780,9 @@ def draft_kernel(
                     store_empty(y_clear.iterator + 4 * index, evict_first())
             cute.arch.sync_threads()
 
-        stamp(stamps, sbase, ST_H2)
         xrow = word_view(normalized_raw, sel * 3072, (3072,), (1,))
         if cta < lm.LM_CTAS:
             wait_count(x_ready, cutlass.Uint32(4))
-            if cutlass.const_expr(DIAG_XDUMP):
-                if cta == 0:
-                    dump = cute.make_tensor(cute.recast_ptr(stamps.iterator, dtype=cutlass.Uint32), cute.make_layout((54272,)))
-                    for j in cutlass.range_constexpr(12):
-                        dump[slot * 3072 + j * 256 + tid] = xrow[j * 256 + tid]
-            stamp_ready(stamps, sbase, ST_LMW, lm_bars.iterator)
             fence_proxy_global()
             if cutlass.const_expr(LM_FP4):
                 lm.lm_head_fp4_stage(cta, xrow, region, red, lm_bars.iterator, lm_bars.iterator + 1, keys, arrivals,
@@ -1947,28 +1801,17 @@ def draft_kernel(
                     xsc = (sx, 1.0 / sx)
                 lm.lm_head_stage(cta, xrow, w_lm8 if LM_FP8 else w_lm, region, red, lm_bars, keys, arrivals,
                                  cutlass.Int32(1), red, False, False,
-                                 stamp_at=cute.make_tensor(stamps.iterator + sbase + ST_RW, cute.make_layout((2,)))
-                                 if (STAMPS and DIAG_LM) else None,
-                                 table_prefetch=tt if LM_TABLE_PF else None, stamp_from=moe.ROUTER_UNITS,
+                                 table_prefetch=tt if LM_TABLE_PF else None,
                                  **(dict(fp8=True, scales=lm_scales, rescore=w_lm_words if LM_FP8_RESCORE else None,
                                          xscale=xsc) if LM_FP8 else {}))
             if cta == lm.LM_CTAS - 1:
-                if cutlass.const_expr(STAMPS and DIAG_LM):
-                    wait_count(arrivals, cutlass.Uint32(lm.LM_CTAS))
-                    stamp(stamps, sbase, ST_RLOG)
                 publish_packet(rank, step, last, key_words, arrivals, tt, slot_mc, own_packets, scalars, draft_tokens,
                                next_new_tokens, accepted, num_accepted)
-                if cutlass.const_expr(DIAG_XDUMP):
-                    if tid == 0:
-                        dump = cute.make_tensor(cute.recast_ptr(stamps.iterator, dtype=cutlass.Uint32), cute.make_layout((54272,)))
-                        dump[24576 + 2 * slot] = f32_bits(scalars[16])
-                        dump[24576 + 2 * slot + 1] = f32_bits(scalars[17])
         else:
             if not last:
                 wait_count(x_ready, cutlass.Uint32(4))
                 hidden_half(cta - lm.LM_CTAS, xrow, gamma_hnorm, hidden_rows, region, red, hh_bars,
                             word_view(slot_mc, PK_HID, (SHARE,), (1,)))
-        stamp(stamps, sbase, ST_LM)
 
 
 @cute.jit
@@ -1988,33 +1831,27 @@ def draft_entry(
     wfa_leader_raw: cute.Tensor, widx_raw: cute.Tensor, idx_kn_w: cute.Tensor, idx_kn_b: cute.Tensor,
     idx_rope_raw: cute.Tensor, idx_pool_raw: cute.Tensor, idx_blocks_raw: cute.Tensor, idx_stride_bytes: cutlass.Int64,
     idx_pages: cutlass.Int64, idx_candidates_raw: cute.Tensor, embed_raw: cute.Tensor, embed_sharded: cutlass.Boolean,
-    eh_w: cute.Tensor, gamma_enorm_raw: cute.Tensor, stamps: cute.Tensor,
-    scale: cutlass.Constexpr, stream, use_pdl: cutlass.Constexpr,
+    eh_w: cute.Tensor, gamma_enorm_raw: cute.Tensor, scale: cutlass.Constexpr, stream, use_pdl: cutlass.Constexpr,
     with_target_argmax: cutlass.Constexpr, with_target_sample: cutlass.Constexpr,
 ):
     sizes = (cute.size(w_router), cute.size(bias), cute.size(w3w1), cute.size(w2), cute.size(w_sgu), cute.size(w_sdn),
-             cute.size(lm_w), cute.size(token_table), cute.size(hidden_rows), cute.size(mc_raw) >= DRAFT_TRANSPORT_WORDS,
-             cute.size(eh_w), cute.size(gamma_enorm_raw), cute.size(length), cute.size(stamps))
+             cute.size(lm_w), cute.size(token_table), cute.size(hidden_rows),
+             cute.size(mc_raw) >= DRAFT_TRANSPORT_WORDS,
+             cute.size(eh_w), cute.size(gamma_enorm_raw), cute.size(length))
     if cutlass.const_expr(LM_FP8X and not (LM_FP8 and H2_XAMAX)):
         raise TypeError("LM_FP8X needs LM_FP8 and H2_XAMAX")
-    if cutlass.const_expr(DIAG_XDUMP and STAMPS):
-        raise TypeError("DIAG_XDUMP reuses the stamps buffer: needs STAMPS = False")
-    if cutlass.const_expr(STAMPS and DIAG_PREFIX and (DIAG_HOP or DIAG_ROUTE or DIAG_LM)):
-        raise TypeError("DIAG_PREFIX shares stamp events 11-13 with DIAG_HOP / DIAG_ROUTE / DIAG_LM: enable one")
-    if cutlass.const_expr(STAMPS and DIAG_LM and (DIAG_HOP or DIAG_ROUTE)):
-        raise TypeError("DIAG_LM shares stamp events 11-14 with DIAG_HOP / DIAG_ROUTE: enable one")
-    if cutlass.const_expr(ROUTE_EARLY_ISSUE and (ABL_ROUTE or not moe.ROUTE_PARALLEL)):
-        raise TypeError("ROUTE_EARLY_ISSUE needs route_moe_parallel (ROUTE_PARALLEL) and no ABL_ROUTE")
-    if cutlass.const_expr(ROUTER_LG and (ROW_HOP or not moe.ROUTE_PARALLEL or ABL_ROUTE)):
-        raise TypeError("ROUTER_LG needs stage_hop H1 (its ssq1 words), ROUTE_PARALLEL and no ABL_ROUTE")
-    if cutlass.const_expr(LM_FP4 and (LM_FP8 or LM_PF_FC2_CHUNKS or LM_PF_CHUNKS or LM_L2_KEEP_CHUNKS or LM_ABL_L2_TILES
-                                       or LM_TABLE_PF or (STAMPS and DIAG_LM))):
-        raise TypeError("LM_FP4 does not combine with LM_FP8 / the BF16 lm knobs / LM_TABLE_PF / DIAG_LM")
-    if cutlass.const_expr(LM_FP8 and (LM_PF_FC2_CHUNKS or LM_PF_CHUNKS or LM_L2_KEEP_CHUNKS or LM_ABL_L2_TILES)):
+    if cutlass.const_expr(ROUTE_EARLY_ISSUE and not moe.ROUTE_PARALLEL):
+        raise TypeError("ROUTE_EARLY_ISSUE needs route_moe_parallel (ROUTE_PARALLEL)")
+    if cutlass.const_expr(ROUTER_LG and (ROW_HOP or not moe.ROUTE_PARALLEL)):
+        raise TypeError("ROUTER_LG needs stage_hop H1 (its ssq1 words) and ROUTE_PARALLEL")
+    if cutlass.const_expr(LM_FP4 and (LM_FP8 or LM_PF_FC2_CHUNKS or LM_PF_CHUNKS or LM_L2_KEEP_CHUNKS
+                                       or LM_TABLE_PF)):
+        raise TypeError("LM_FP4 does not combine with LM_FP8 / the BF16 lm knobs / LM_TABLE_PF")
+    if cutlass.const_expr(LM_FP8 and (LM_PF_FC2_CHUNKS or LM_PF_CHUNKS or LM_L2_KEEP_CHUNKS)):
         raise TypeError("LM_FP8 does not combine with the BF16 lm prefetch / keep / ablation knobs")
     want = (W_ROUTER_ELEMS, moe.EXPERTS, moe.EXPERTS * 2 * moe.INTER * HIDDEN, moe.EXPERTS * HIDDEN * moe.INTER,
             2 * moe.INTER * HIDDEN, HIDDEN * moe.INTER, W_LM_ELEMS, VOCAB_SHARD * HIDDEN, SHARE * HIDDEN, True,
-            HIDDEN * s0.WINDOW, HIDDEN, 7, STAMP_SLOTS * 212 * STAMP_EVENTS)
+            HIDDEN * s0.WINDOW, HIDDEN, 7)
     if cutlass.const_expr(sizes != want):
         raise TypeError(f"draft_entry: operand sizes {sizes} != {want}")
     pool_rows = cute.make_tensor(idx_pool_raw.iterator,
@@ -2032,8 +1869,8 @@ def draft_entry(
                  num_accepted, copy, rank, step, last, stride_rows, layer_rows, max_blocks, clear_first,
                  kind, wfa_leader_raw.iterator, widx_raw.iterator, idx_kn_w.iterator,
                  idx_kn_b.iterator, idx_rope_raw.iterator, idx_pool_raw.iterator, idx_blocks_raw.iterator,
-                 idx_stride_bytes, idx_pages, idx_candidates_raw, key_atom, embed_raw, embed_sharded, eh_w,
-                 gamma_enorm_raw, stamps, eh_atom, scale, with_target_argmax, with_target_sample).launch(
+                 idx_stride_bytes, idx_pages, idx_candidates_raw, key_atom, embed_raw, embed_sharded, gamma_enorm_raw,
+                 eh_atom, scale, with_target_argmax, with_target_sample).launch(
         grid=(212, 1, 1), block=(256, 1, 1), min_blocks_per_mp=1, stream=stream, use_pdl=use_pdl)
 
 

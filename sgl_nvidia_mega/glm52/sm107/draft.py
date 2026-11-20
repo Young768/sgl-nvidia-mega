@@ -28,7 +28,6 @@ COUNTED_CLEARS = 155
 CAND_WORDS = COPIES * 8 * ((1 << 20) + 8192) * 2
 DRAFT_TRANSPORT_WORDS = 3122112
 VOCAB, SHARD, HIDDEN, INTER = 154880, 9680, 6144, 128
-STAMP_WORDS = 8 * 212 * 16
 LG_W_WORDS = 16 * 38 * 512
 W_ROUTER_ELEMS = 256 * HIDDEN + 2 * LG_W_WORDS
 W_LM_ELEMS = SHARD * HIDDEN + (SHARD * 3456 + 4 * SHARD) // 2
@@ -250,8 +249,7 @@ class DraftRunner:
                       residual_out=torch.zeros((8, HIDDEN), **bf), normalized=torch.zeros((8, HIDDEN), **bf),
                       topk=torch.full((8, 2048), -1, **i32), draft_tokens=torch.zeros((8,), **i32),
                       next_new_tokens=torch.zeros((8,), **i32), accepted=torch.zeros((8,), **i32),
-                      num_accepted=torch.ones((1,), **i32), length=torch.full((7,), 8, **i32),
-                      stamps=torch.zeros((STAMP_WORDS,), dtype=torch.int64, device=dev))
+                      num_accepted=torch.ones((1,), **i32), length=torch.full((7,), 8, **i32))
         self.dt64 = torch.zeros((1, 7), dtype=torch.int64, device=dev)
         self.sel_hidden = torch.zeros((1, HIDDEN), **bf)
         self.kernel = launch.Kernel(CUBIN, CALL, launch.DRAFT_PARAMS)
@@ -266,7 +264,7 @@ class DraftRunner:
             stride_rows=64, layer_rows=0, max_blocks=TABLE_ROWS, clear_first=0,
             idx_rope=ch.idx_rope.data_ptr(), idx_pool=kb.data_ptr(), idx_blocks=ch.bt.data_ptr(),
             idx_stride_bytes=stride, idx_pages=kb.shape[0], idx_candidates=ws["idx_candidates"].data_ptr(),
-            embed_sharded=0, stamps=p["stamps"].data_ptr(),
+            embed_sharded=0,
             **{k: w[k].data_ptr() for k in ("w_router", "bias", "w3w1", "w2", "w_sgu", "w_sdn", "gamma_kv", "gamma_in",
                                             "gamma_post", "gamma_head", "gamma_hnorm", "lm_w", "token_table",
                                             "hidden_rows", "wfa_leader", "widx", "idx_kn_w", "idx_kn_b", "embed",

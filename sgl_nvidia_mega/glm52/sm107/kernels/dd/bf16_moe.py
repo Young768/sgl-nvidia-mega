@@ -157,11 +157,6 @@ def routing_weight(s: cutlass.Float32, total: cutlass.Float32, c: cutlass.Conste
     return result
 
 
-@dsl_user_op
-def global_timer_u64(*, loc=None, ip=None):
-    return cutlass.Uint64(cute.arch.globaltimer(loc=loc, ip=ip))
-
-
 POLL_PARALLEL = True
 
 
@@ -251,8 +246,7 @@ def router_unit(unit: cutlass.Int32, x: cute.Tensor, x_off: cutlass.Int32, base:
 
 
 @cute.jit
-def route_moe(logits: cute.Tensor, bias: cute.Tensor, sm: cute.Tensor, scale: cutlass.Constexpr, stamp_at=None,
-              probe=None):
+def route_moe(logits: cute.Tensor, bias: cute.Tensor, sm: cute.Tensor, scale: cutlass.Constexpr):
     tid, _, _ = cute.arch.thread_idx()
     lane = tid & 31
     if tid < 32:
@@ -272,12 +266,6 @@ def route_moe(logits: cute.Tensor, bias: cute.Tensor, sm: cute.Tensor, scale: cu
                 for i in cutlass.range_constexpr(8):
                     if lw[i] == cutlass.Uint32(EMPTY):
                         lw[i] = volatile_word(logits.iterator + i * 32 + lane)
-        if cutlass.const_expr(stamp_at is not None):
-            if lane == 0:
-                stamp_at[0] = global_timer_u64()
-        if cutlass.const_expr(probe is not None):
-            if lane == 0:
-                probe[0] = global_timer_u64()
         hi = cute.make_rmem_tensor((8,), cutlass.Uint32)
         for i in cutlass.range_constexpr(8):
             sig = sigmoid_accurate(bits_f32(lw[i]))
@@ -288,9 +276,6 @@ def route_moe(logits: cute.Tensor, bias: cute.Tensor, sm: cute.Tensor, scale: cu
                 twiddled = ~score
             hi[i] = twiddled
         cute.arch.sync_warp()
-        if cutlass.const_expr(probe is not None):
-            if lane == 0:
-                probe[1] = global_timer_u64()
         taken = cutlass.Uint32(0)
         mine = cutlass.Uint32(0)
         for k in cutlass.range_constexpr(TOPK):
@@ -311,9 +296,6 @@ def route_moe(logits: cute.Tensor, bias: cute.Tensor, sm: cute.Tensor, scale: cu
                 taken |= cutlass.Uint32(1) << (expert >> cutlass.Uint32(5))
             if lane == k:
                 mine = expert
-        if cutlass.const_expr(probe is not None):
-            if lane == 0:
-                probe[2] = global_timer_u64()
         s = cutlass.Float32(0.0)
         if lane < TOPK:
             s = bits_f32(sm[SM_SIG + mine.to(cutlass.Int32)])
@@ -324,14 +306,7 @@ def route_moe(logits: cute.Tensor, bias: cute.Tensor, sm: cute.Tensor, scale: cu
             w = routing_weight(s, total, scale)
             sm[SM_ROUTE + lane] = mine
             sm[SM_ROUTE + 8 + lane] = f32_bits(w)
-        if cutlass.const_expr(probe is not None):
-            if lane == 0:
-                probe[3] = global_timer_u64()
     cute.arch.sync_threads()
-    if cutlass.const_expr(probe is not None):
-        tid2, _, _ = cute.arch.thread_idx()
-        if tid2 == 0:
-            probe[4] = global_timer_u64()
 
 
 ROUTE_PARALLEL = True
@@ -339,7 +314,7 @@ ROUTE_PARALLEL = True
 
 @cute.jit
 def route_moe_parallel(logits: cute.Tensor, bias: cute.Tensor, sm: cute.Tensor, scale: cutlass.Constexpr,
-                       stamp_at=None, probe=None, ssq=None, after_select=None):
+                       ssq=None, after_select=None):
     tid, _, _ = cute.arch.thread_idx()
     warp, lane = tid >> 5, tid & 31
     bv = bias[tid]
@@ -360,23 +335,12 @@ def route_moe_parallel(logits: cute.Tensor, bias: cute.Tensor, sm: cute.Tensor, 
         ssq_total += bits_f32(sm[SM_RSUM + 3])
         rstd = cute.math.rsqrt(ssq_total / 6144.0 + 1.0e-5, fastmath=True)
         lw = f32_bits((cutlass.Float32(0.0) + bits_f32(lw)) * rstd)
-    if cutlass.const_expr(stamp_at is not None):
-        cute.arch.sync_threads()
-        if tid == 0:
-            stamp_at[0] = global_timer_u64()
-    if cutlass.const_expr(probe is not None):
-        cute.arch.sync_threads()
-        if tid == 0:
-            probe[0] = global_timer_u64()
     sig = sigmoid_accurate(bits_f32(lw))
     sm[SM_SIG + tid] = f32_bits(sig)
     score = f32_bits(sig + bv)
     key = score ^ cutlass.Uint32(0x80000000)
     if (score >> 31) != cutlass.Uint32(0):
         key = ~score
-    if cutlass.const_expr(probe is not None):
-        if tid == 0:
-            probe[1] = global_timer_u64()
     local = cutlass.Int32(0)
     for d in cutlass.range_constexpr(1, 32):
         src = (lane + d) & 31
@@ -400,9 +364,6 @@ def route_moe_parallel(logits: cute.Tensor, bias: cute.Tensor, sm: cute.Tensor, 
     cute.arch.sync_threads()
     if cutlass.const_expr(after_select is not None):
         after_select()
-    if cutlass.const_expr(probe is not None):
-        if tid == 0:
-            probe[2] = global_timer_u64()
     if tid < 32:
         s = cutlass.Float32(0.0)
         if lane < TOPK:
@@ -412,13 +373,7 @@ def route_moe_parallel(logits: cute.Tensor, bias: cute.Tensor, sm: cute.Tensor, 
             total = total + cute.arch.shuffle_sync_bfly(total, 16 >> sh)
         if lane < TOPK:
             sm[SM_ROUTE + 8 + lane] = f32_bits(routing_weight(s, total, scale))
-        if cutlass.const_expr(probe is not None):
-            if lane == 0:
-                probe[3] = global_timer_u64()
     cute.arch.sync_threads()
-    if cutlass.const_expr(probe is not None):
-        if tid == 0:
-            probe[4] = global_timer_u64()
 
 
 @cute.jit

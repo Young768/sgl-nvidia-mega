@@ -28,7 +28,6 @@ EMB_WORDS = 8 * HIDDEN // 2
 NORM_CTA = 200
 OWNER_CTA = 204
 AR_CTA = 180
-EH_UMMA = True
 FA_STOCK = True
 EH_BARS = 8
 EH_B_BASE = 6 * 16384
@@ -214,61 +213,6 @@ def norm_rows_unit(index: cutlass.Int32, rank: cutlass.Int32, ids: cute.Tensor, 
 
 
 @cute.jit
-def issue_eh_weights(tile: cutlass.Int32, eh_w: cute.Tensor, region: cute.Tensor, bars: cute.Tensor):
-    tid, _, _ = cute.arch.thread_idx()
-    base = region.iterator.toint().to(cutlass.Uint32)
-    if tid < 4:
-        cute.arch.mbarrier_arrive_and_expect_tx(bars.iterator + tid, 16 * EH_ROW_BYTES)
-    if tid < 64:
-        bulk_copy(base + (tid * EH_ROW_STRIDE).to(cutlass.Uint32), eh_w.iterator + (tile * 64 + tid) * WINDOW,
-                  cutlass.Uint32(EH_ROW_BYTES), bars.iterator + tid // 16, evict_first())
-
-
-@cute.jit
-def eh_unit(tile: cutlass.Int32, rank: cutlass.Int32, nw: cute.Tensor, region: cute.Tensor, red: cute.Tensor,
-            bars: cute.Tensor, eh_mc: cute.Tensor):
-    tid, _, _ = cute.arch.thread_idx()
-    warp, lane = tid >> 5, tid & 31
-    group, tig = lane >> 2, lane & 3
-    mt, kh = warp % 4, warp // 4
-    base = region.iterator.toint().to(cutlass.Uint32)
-    for j in cutlass.range_constexpr(3):
-        vi = tid + 256 * j
-        r, w = vi // 96, (vi % 96) * 4
-        a, b, c, d = poll4(nw.iterator + r * (WINDOW // 2) + w)
-        shared_store4(base + cutlass.Uint32(EH_X_BASE) + (r * EH_ROW_STRIDE + w * 4).to(cutlass.Uint32), a, b, c, d)
-    cute.arch.sync_threads()
-    cute.arch.mbarrier_wait(bars.iterator + mt, 0)
-    acc = cute.make_rmem_tensor((4,), cutlass.Float32)
-    for e in cutlass.range_constexpr(4):
-        acc[e] = cutlass.Float32(0)
-    wseg = base + (mt * 16 * EH_ROW_STRIDE + kh * (WINDOW) + tig * 16).to(cutlass.Uint32)
-    xseg = base + cutlass.Uint32(EH_X_BASE) + (group * EH_ROW_STRIDE + kh * (WINDOW) + tig * 16).to(cutlass.Uint32)
-    for s in cutlass.range_constexpr(EH_STEPS):
-        lo0, lo1, lo2, lo3 = lds128(wseg + cutlass.Uint32(group * EH_ROW_STRIDE + s * 64))
-        hi0, hi1, hi2, hi3 = lds128(wseg + cutlass.Uint32((group + 8) * EH_ROW_STRIDE + s * 64))
-        x0, x1, x2, x3 = lds128(xseg + cutlass.Uint32(s * 64))
-        c0, c1, c2, c3 = mma_bf16(acc[0], acc[1], acc[2], acc[3], lo0, hi0, lo1, hi1, x0, x1)
-        c0, c1, c2, c3 = mma_bf16(c0, c1, c2, c3, lo2, hi2, lo3, hi3, x2, x3)
-        acc[0], acc[1], acc[2], acc[3] = c0, c1, c2, c3
-    if kh == 1:
-        for e in cutlass.range_constexpr(4):
-            red[(mt * 4 + e) * 32 + lane] = acc[e]
-    cute.arch.sync_threads()
-    if kh == 0:
-        for e in cutlass.range_constexpr(4):
-            hsum = acc[e] + red[(mt * 4 + e) * 32 + lane]
-            row = mt * 16 + group + (e // 2) * 8
-            token = 2 * tig + e % 2
-            red[512 + token * 64 + row] = round_bf16(hsum)
-    cute.arch.sync_threads()
-    token, pair = tid // 32, tid % 32
-    word = bf16_pair(red[512 + token * 64 + 2 * pair], red[512 + token * 64 + 2 * pair + 1])
-    store_word(eh_mc.iterator + (token * RANKS + rank) * (HIDDEN // 2) + tile * 32 + pair, published_word(word))
-    cute.arch.sync_threads()
-
-
-@cute.jit
 def ar_unit(unit: cutlass.Int32, eh_uc: cute.Tensor, gamma_in: cute.Tensor, residual0: cute.Tensor,
             x_frag: cute.Tensor, x_ssq: cute.Tensor, scalars: cute.Tensor, xn=None, ns=None):
     tid, _, _ = cute.arch.thread_idx()
@@ -396,25 +340,19 @@ def eh_unit_umma(tile: cutlass.Int32, rank: cutlass.Int32, nw: cute.Tensor, regi
 @cute.jit
 def s0_front(cta: cutlass.Int32, rank: cutlass.Int32, ids: cute.Tensor, embed: cute.Tensor,
              sharded: cutlass.Boolean, emb_uc: cute.Tensor, emb_mc: cute.Tensor, hidden: cute.Tensor,
-             gamma_e: cute.Tensor, gamma_h: cute.Tensor, eh_w: cute.Tensor, nw: cute.Tensor, eh_uc: cute.Tensor,
+             gamma_e: cute.Tensor, gamma_h: cute.Tensor, nw: cute.Tensor, eh_uc: cute.Tensor,
              eh_mc: cute.Tensor, gamma_in: cute.Tensor, residual0: cute.Tensor, x_frag: cute.Tensor,
              x_ssq: cute.Tensor, region: cute.Tensor, red: cute.Tensor, scalars: cute.Tensor, eh_bars: cute.Tensor,
              eh_atom=None, tmem_slot=None, xn=None, ns=None):
     if cta < EH_TILES:
-        if cutlass.const_expr(EH_UMMA):
-            issue_eh_weights_umma(cta, eh_atom, region, eh_bars)
-        else:
-            issue_eh_weights(cta, eh_w, region, eh_bars)
+        issue_eh_weights_umma(cta, eh_atom, region, eh_bars)
     cute.arch.griddepcontrol_wait()
     if (cta >= OWNER_CTA) & sharded:
         embed_owner_unit(cta - OWNER_CTA, rank, ids, embed, emb_mc)
     if (cta >= NORM_CTA) & (cta < NORM_CTA + 2):
         norm_rows_unit(cta - NORM_CTA, rank, ids, embed, sharded, emb_uc, hidden, gamma_e, gamma_h, nw, red)
     if cta < EH_TILES:
-        if cutlass.const_expr(EH_UMMA):
-            eh_unit_umma(cta, rank, nw, region, red, eh_bars, tmem_slot, eh_mc)
-        else:
-            eh_unit(cta, rank, nw, region, red, eh_bars, eh_mc)
+        eh_unit_umma(cta, rank, nw, region, red, eh_bars, tmem_slot, eh_mc)
     if cta >= AR_CTA:
         ar_unit(cta - AR_CTA, eh_uc, gamma_in, residual0, x_frag, x_ssq, scalars, xn, ns)
     proxy_fence()
@@ -432,13 +370,12 @@ from .common import (
     bits_f32,
     f32_bits,
     mul_rn,
-    bulk_copy,
     proxy_fence,
     tc_before,
     tc_after,
 )
-from .attention import bf16_pair, mma_bf16, published_word, bf16_from_word, volatile_vector, EMPTY, shared_store4
-from .gpu_publication import lds128, readonly_vector, global_vector, store_vector, store_word
+from .attention import bf16_pair, published_word, bf16_from_word, volatile_vector, EMPTY, shared_store4
+from .gpu_publication import readonly_vector, global_vector, store_vector, store_word
 from .indexer import round_bf16
 from .bf16_moe import add_rn, div_rn
 from .lm_umma import tma_2d_elect, expect_tx_elect, umma_bf16_elect, commit_elect, tmem_dealloc32

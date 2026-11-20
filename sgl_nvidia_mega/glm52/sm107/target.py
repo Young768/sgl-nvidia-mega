@@ -74,7 +74,7 @@ DRAFT_PARAMS = (
     ("kind", 4, "i"), ("wfa_leader", 8, "p"), ("widx", 8, "p"), ("idx_kn_w", 8, "p"),
     ("idx_kn_b", 8, "p"), ("idx_rope", 8, "p"), ("idx_pool", 8, "p"), ("idx_blocks", 8, "p"),
     ("idx_stride_bytes", 8, "q"), ("idx_pages", 8, "q"), ("idx_candidates", 8, "p"), ("key_tma", 128, "t"),
-    ("embed", 8, "p"), ("embed_sharded", 1, "b"), ("eh_w", 8, "p"), ("gamma_enorm", 8, "p"), ("stamps", 8, "p"),
+    ("embed", 8, "p"), ("embed_sharded", 1, "b"), ("gamma_enorm", 8, "p"),
     ("eh_tma", 128, "t"),
 )
 KIND_SK, KIND_S0 = 0, 2

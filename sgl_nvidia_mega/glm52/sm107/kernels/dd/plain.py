@@ -4,7 +4,6 @@ import cutlass
 from cutlass._mlir import ir
 from cutlass._mlir.dialects import func
 import cutlass.cute as cute
-from cutlass.cutlass_dsl import dsl_user_op
 
 
 MOE_E = 0
@@ -476,11 +475,6 @@ def issue_prefix_weights(wfa: cute.Tensor, wqb: cute.Tensor, region: cute.Tensor
             first_weights(cta - 164, wqb, region, bar)
 
 
-@dsl_user_op
-def prefix_timer(*, loc=None, ip=None):
-    return cutlass.Uint64(cute.arch.globaltimer(loc=loc, ip=ip))
-
-
 @cute.jit
 def prefix_roles(x: cute.Tensor, x_frag: cute.Tensor, x_ssq: cute.Tensor,
                     previous_clear: cute.Tensor, early_x: cutlass.Boolean,
@@ -490,7 +484,7 @@ def prefix_roles(x: cute.Tensor, x_frag: cute.Tensor, x_ssq: cute.Tensor,
                     kv_arena: cute.Tensor, stride_rows: cutlass.Int64, layer_rows: cutlass.Int64,
                     region: cute.Tensor, red: cute.Tensor, scalars: cute.Tensor, bar: cute.Pointer,
                     weights_issued: cutlass.Constexpr = False, y_mc=None, append_from=None,
-                    fa_carry=None, fa_scale_carry=None, fa_stock: cutlass.Constexpr = False, stamp_at=None,
+                    fa_carry=None, fa_scale_carry=None, fa_stock: cutlass.Constexpr = False,
                     short_ctx: cutlass.Constexpr = False):
     tid, _, _ = cute.arch.thread_idx()
     cta, _, _ = cute.arch.block_idx()
@@ -521,9 +515,6 @@ def prefix_roles(x: cute.Tensor, x_frag: cute.Tensor, x_ssq: cute.Tensor,
                              scale_carry=fa_scale_carry, stock_order=fa_stock)
         proxy_fence()
         cute.arch.sync_threads()
-        if cutlass.const_expr(stamp_at is not None):
-            if tid == 0:
-                stamp_at[0] = prefix_timer()
     if early:
         cute.arch.griddepcontrol_wait()
         cute.arch.griddepcontrol_launch_dependents()
@@ -531,18 +522,12 @@ def prefix_roles(x: cute.Tensor, x_frag: cute.Tensor, x_ssq: cute.Tensor,
         qb_stage(cta - 164, y, region, red, scalars, bar, rope, length, q8, clamp_pos=short_ctx)
         proxy_fence()
         cute.arch.sync_threads()
-        if cutlass.const_expr(stamp_at is not None):
-            if tid == 0:
-                stamp_at[1] = prefix_timer()
     if cta == 163:
         tail = cute.make_tensor(cute.recast_ptr(y.iterator + 1024, dtype=cutlass.BFloat16),
                                 cute.make_layout((8, 576), stride=(2624, 1)))
         append_stage(tail, gamma_kv, rope, length, table, cache, kv_arena, stride_rows, layer_rows, append_from, clamp_pos=short_ctx)
         proxy_fence()
         cute.arch.sync_threads()
-        if cutlass.const_expr(stamp_at is not None):
-            if tid == 0:
-                stamp_at[2] = prefix_timer()
 
 
 @cute.jit
@@ -552,7 +537,7 @@ def plain_front_body(
     gamma_kv: cute.Tensor, rope: cute.Tensor, length: cute.Tensor, table: cute.Tensor,
     cache: cute.Tensor, kv_arena: cute.Tensor, stride_rows: cutlass.Int64, layer_rows: cutlass.Int64,
     next_counters: cute.Tensor, y_mc: cute.Tensor, storage: cute.Tensor,
-    append_from=None, fa_carry=None, fa_scale_carry=None, fa_stock: cutlass.Constexpr = False, stamp_at=None,
+    append_from=None, fa_carry=None, fa_scale_carry=None, fa_stock: cutlass.Constexpr = False,
     short_ctx: cutlass.Constexpr = False,
 ):
     tid, _, _ = cute.arch.thread_idx()
@@ -572,7 +557,7 @@ def plain_front_body(
     prefix_roles(x, x_frag, x_ssq, previous_clear, early_x, wfa, wqb, y, q8, gamma_kv, rope,
                    length, table, cache, kv_arena, stride_rows, layer_rows, region, red, scalars, all_bars.iterator,
                    weights_issued=True, y_mc=y_mc, append_from=append_from,
-                   fa_carry=fa_carry, fa_scale_carry=fa_scale_carry, fa_stock=fa_stock, stamp_at=stamp_at, short_ctx=short_ctx)
+                   fa_carry=fa_carry, fa_scale_carry=fa_scale_carry, fa_stock=fa_stock, short_ctx=short_ctx)
 
 
 # Imported last: the role modules import each other, and their names are used only when a kernel is traced.

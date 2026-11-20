@@ -245,11 +245,6 @@ def bulk_copy(dst: cutlass.Uint32, src: cute.Pointer, size: cutlass.Uint32, bar:
                                              size.ir_value(loc=loc, ip=ip), l2_cache_hint=hint, loc=loc, ip=ip)
 
 
-@dsl_user_op
-def hop_timer(*, loc=None, ip=None):
-    return cutlass.Uint64(cute.arch.globaltimer(loc=loc, ip=ip))
-
-
 @cute.jit
 def hop1_word_offset(token: cutlass.Int32, rank: cutlass.Int32, col: cutlass.Int32):
     return ((rank * 192 + col // 32) * 8 + token) * 16 + (col % 32) // 2
@@ -262,33 +257,7 @@ def xfrag_word_offset(token: cutlass.Int32, col: cutlass.Int32):
 
 @cute.jit
 def reduce_rank16(buf: cute.Tensor, token: cutlass.Int32, col: cutlass.Int32,
-                   first: cutlass.Constexpr, count: cutlass.Constexpr = False, force=None, own_rank=None):
-    if cutlass.const_expr(own_rank is not None):
-        offset = (token * 16 + own_rank) * 3072 + col // 2
-        if cutlass.const_expr(first):
-            offset = hop1_word_offset(token, own_rank, col)
-        w = cute.make_rmem_tensor((4,), cutlass.Uint32)
-        w[0], w[1], w[2], w[3] = volatile_vector(buf.iterator + offset)
-        waiting = cutlass.Boolean(True)
-        iters = cutlass.Int32(0)
-        while waiting:
-            full = (w[0] != cutlass.Uint32(0x80000000)) & (w[1] != cutlass.Uint32(0x80000000)) & \
-                (w[2] != cutlass.Uint32(0x80000000)) & (w[3] != cutlass.Uint32(0x80000000))
-            if cutlass.const_expr(force is not None):
-                full = full | force
-            if cute.arch.vote_all_sync(full):
-                waiting = cutlass.Boolean(False)
-            else:
-                if cutlass.const_expr(count):
-                    iters = iters + 1
-                w[0], w[1], w[2], w[3] = volatile_vector(buf.iterator + offset)
-        own = cute.make_rmem_tensor((8,), cutlass.Float32)
-        for j in cutlass.range_constexpr(4):
-            own[2 * j] = bf16_from_word(w[j], False)
-            own[2 * j + 1] = bf16_from_word(w[j], True)
-        if cutlass.const_expr(count):
-            return own, iters
-        return own
+                   first: cutlass.Constexpr, force=None):
     payload = cute.make_rmem_tensor((16, 4), cutlass.Uint32)
     for rank in cutlass.range_constexpr(16):
         offset = (token * 16 + rank) * 3072 + col // 2
@@ -297,7 +266,6 @@ def reduce_rank16(buf: cute.Tensor, token: cutlass.Int32, col: cutlass.Int32,
         a, b, c, d = volatile_vector(buf.iterator + offset)
         payload[rank, 0], payload[rank, 1], payload[rank, 2], payload[rank, 3] = a, b, c, d
     waiting = cutlass.Boolean(True)
-    iters = cutlass.Int32(0)
     while waiting:
         full = cutlass.Boolean(True)
         for rank in cutlass.range_constexpr(16):
@@ -308,8 +276,6 @@ def reduce_rank16(buf: cute.Tensor, token: cutlass.Int32, col: cutlass.Int32,
         if cute.arch.vote_all_sync(full):
             waiting = cutlass.Boolean(False)
         else:
-            if cutlass.const_expr(count):
-                iters = iters + 1
             for rank in cutlass.range_constexpr(16):
                 ready = cutlass.Boolean(True)
                 for j in cutlass.range_constexpr(4):
@@ -334,8 +300,6 @@ def reduce_rank16(buf: cute.Tensor, token: cutlass.Int32, col: cutlass.Int32,
                 high[2 * j + 1] += bf16_from_word(payload[rank, j], True)
     for j in cutlass.range_constexpr(8):
         low[j] = (cutlass.Float32(0) + low[j]) + high[j]
-    if cutlass.const_expr(count):
-        return low, iters
     return low
 
 
@@ -367,13 +331,12 @@ def stage_hop(unit: cutlass.Int32, second: cutlass.Constexpr, x_only: cutlass.Bo
                 next_x: cute.Tensor, next_ssq: cute.Tensor,
                 normalized_output: cute.Tensor, residual_output: cute.Tensor,
                 warm_region=None, warm_tmem=None, warm_bar=None, extra_token=None,
-                diag=None, diag_base=None, diag_events=None, lean: cutlass.Constexpr = False, warm=None,
-                own_rank=None, amax_out=None):
+                lean: cutlass.Constexpr = False, warm=None,
+                amax_out=None):
     if cutlass.const_expr(warm is None):
         hop_pass(unit, second, x_only, hop1, hop2, previous_hop2, residual_input, gamma, in_scale, shared_residual,
                  scalars, ssq1, ssq2, h, hp, hfp4, next_x, next_ssq, normalized_output, residual_output,
-                 warm_region, warm_tmem, warm_bar, extra_token, diag, diag_base, diag_events, lean, None, own_rank,
-                 amax_out)
+                 warm_region, warm_tmem, warm_bar, extra_token, lean, None, amax_out)
     else:
         if cutlass.const_expr(not lean or warm_region is not None or extra_token is not None):
             raise TypeError("stage_hop(warm) needs lean and no warm_moe / extra_token")
@@ -385,8 +348,7 @@ def stage_hop(unit: cutlass.Int32, second: cutlass.Constexpr, x_only: cutlass.Bo
             hop_pass(unit, second, x_only, hop1, hop2, previous_hop2, residual_input, gamma, in_scale,
                      shared_residual, scalars, redirect(ssq1, scratch_ssq, force), redirect(ssq2, scratch_ssq, force),
                      redirect(h, scratch, force), hp, hfp4, next_x, next_ssq, redirect(normalized_output, scratch, force),
-                     redirect(residual_output, scratch, force), None, None, None, None, diag, diag_base, diag_events,
-                     lean, force, own_rank,
+                     redirect(residual_output, scratch, force), None, None, None, None, lean, force,
                      None if amax_out is None else redirect(amax_out, scratch_ssq, force))
 
 
@@ -400,8 +362,8 @@ def hop_pass(unit: cutlass.Int32, second: cutlass.Constexpr, x_only: cutlass.Boo
                 next_x: cute.Tensor, next_ssq: cute.Tensor,
                 normalized_output: cute.Tensor, residual_output: cute.Tensor,
                 warm_region=None, warm_tmem=None, warm_bar=None, extra_token=None,
-                diag=None, diag_base=None, diag_events=None, lean: cutlass.Constexpr = False, force=None,
-                own_rank=None, amax_out=None):
+                lean: cutlass.Constexpr = False, force=None,
+                amax_out=None):
     tid, _, _ = cute.arch.thread_idx()
     token, quarter = unit // 4, unit % 4
     col = 1536 * quarter + 8 * tid
@@ -425,25 +387,13 @@ def hop_pass(unit: cutlass.Int32, second: cutlass.Constexpr, x_only: cutlass.Boo
     if active:
         if cutlass.const_expr(second):
             self_clear(hop1, previous_hop2, token, col)
-            if cutlass.const_expr(diag is not None):
-                sums, iters = reduce_rank16(hop2, token, col, False, True, force, own_rank)
-                if tid == 0:
-                    diag[diag_base + diag_events[0]] = hop_timer()
-                    diag[diag_base + diag_events[1]] = iters.to(cutlass.Uint64)
-            else:
-                sums = reduce_rank16(hop2, token, col, False, False, force, own_rank)
+            sums = reduce_rank16(hop2, token, col, False, force)
             if cutlass.const_expr(extra_token is not None):
                 extra = reduce_rank16(hop2, cutlass.Int32(extra_token), col, False)
                 for j in cutlass.range_constexpr(8):
                     sums[j] = sums[j] + extra[j]
         else:
-            if cutlass.const_expr(diag is not None):
-                sums, iters = reduce_rank16(hop1, token, col, True, True, force, own_rank)
-                if tid == 0:
-                    diag[diag_base + diag_events[0]] = hop_timer()
-                    diag[diag_base + diag_events[1]] = iters.to(cutlass.Uint64)
-            else:
-                sums = reduce_rank16(hop1, token, col, True, False, force, own_rank)
+            sums = reduce_rank16(hop1, token, col, True, force)
         for j in cutlass.range_constexpr(4):
             residual[2 * j] = round_bf16(round_bf16(sums[2 * j]) + bf16_from_word(res_prev[j], False))
             residual[2 * j + 1] = round_bf16(round_bf16(sums[2 * j + 1]) + bf16_from_word(res_prev[j], True))
@@ -517,9 +467,6 @@ def hop_pass(unit: cutlass.Int32, second: cutlass.Constexpr, x_only: cutlass.Boo
                     scalars[8], scalars[9], scalars[10], scalars[11] = bits_f32(a), bits_f32(b), bits_f32(c), bits_f32(d)
                     waiting = cutlass.Boolean(False)
     cute.arch.sync_threads()
-    if cutlass.const_expr(diag is not None and len(diag_events) > 2):
-        if tid == 0:
-            diag[diag_base + diag_events[2]] = hop_timer()
     materialize = cutlass.Boolean(True)
     if cutlass.const_expr(second):
         materialize = not x_only
